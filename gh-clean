@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# gh-clean: delete local git branches that are clearly done.
+# See `gh clean --help` for behavior.
+
+set -euo pipefail
+
+base_branch="main"
+dry_run=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --base)
+      base_branch="${2:-}"
+      [ -z "$base_branch" ] && { echo "gh-clean: --base needs a value" >&2; exit 2; }
+      shift 2 ;;
+    --dry-run)
+      dry_run=1; shift ;;
+    -h|--help)
+      cat <<'EOF'
+gh-clean: delete local git branches that are clearly done.
+
+Usage: gh clean [--base <branch>] [--dry-run]
+
+Options:
+  --base <branch>   Base to compare against (default: main)
+  --dry-run         Print what would be deleted, change nothing
+  -h, --help        Show this help
+
+Deletes branches that are:
+  (a) merged into the base (regular, merge-commit, or squash-merge,
+      detected via patch-id),
+  (b) attached to a GitHub PR that is MERGED or CLOSED (requires gh CLI),
+  (c) tipped by a commit you didn't author, i.e. a review branch you
+      pulled down and forgot, or
+  (d) yours, with no PR record, and untouched for GH_CLEAN_STALE_DAYS
+      days (default 7), i.e. an orphan local experiment. Skipped if gh
+      data is unavailable so missing PR info can't be misread as "no
+      branch has a PR".
+
+Branches checked out in any worktree are never deleted.
+
+Env:
+  GH_CLEAN_STALE_DAYS   Days for rule (d) (default: 7)
+EOF
+      exit 0 ;;
+    *)
+      echo "gh-clean: unknown argument '$1' (try --help)" >&2; exit 2 ;;
+  esac
+done
+
+git rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
+  echo "gh-clean: not inside a git repository" >&2
+  exit 1
+}
+
+stale_days="${GH_CLEAN_STALE_DAYS:-7}"
+stale_cutoff=$(( $(date +%s) - stale_days * 86400 ))
+
+# Refresh origin/<base> so the merge check runs against the latest tip.
+git fetch --prune --quiet origin 2>/dev/null || true
+
+if git show-ref --verify --quiet "refs/remotes/origin/$base_branch"; then
+  base="origin/$base_branch"
+elif git show-ref --verify --quiet "refs/heads/$base_branch"; then
+  base="$base_branch"
+else
+  echo "gh-clean: no '$base_branch' branch found locally or on origin" >&2
+  exit 1
+fi
+base_sha=$(git rev-parse "$base")
+
+my_email=$(git config user.email)
+
+# One round-trip for all PR states. Silently skipped if gh is missing or
+# unauth'd; the local + author checks still run, just without the PR
+# fallback (rules (b) and (d)).
+pr_data=""
+if command -v gh >/dev/null 2>&1; then
+  pr_data=$(gh pr list --state all --limit 1000 \
+    --json state,headRefName \
+    --jq '.[] | "\(.state) \(.headRefName)"' 2>/dev/null) || pr_data=""
+fi
+
+# Branches checked out in *any* worktree, never delete these.
+protected=$(git worktree list --porcelain | sed -n 's@^branch refs/heads/@@p')
+
+drop() {
+  local branch="$1" reason="$2"
+  if [ "$dry_run" -eq 1 ]; then
+    printf '  would delete %-45s [%s]\n' "$branch" "$reason"
+    return 0
+  fi
+  git branch -D "$branch" >/dev/null && \
+    printf '  deleted %-45s [%s]\n' "$branch" "$reason"
+}
+
+deleted_merged=0
+deleted_abandoned=0
+deleted_review=0
+deleted_stale=0
+
+while IFS= read -r branch; do
+  [ -n "$branch" ] || continue
+  case "$branch" in main|master) continue ;; esac
+  [ "$branch" = "$base_branch" ] && continue
+  printf '%s\n' "$protected" | grep -qxF -- "$branch" && continue
+
+  # (a1) Regular merge: branch tip is reachable from base.
+  if git merge-base --is-ancestor "$branch" "$base_sha" 2>/dev/null; then
+    drop "$branch" "merged" && deleted_merged=$((deleted_merged + 1))
+    continue
+  fi
+
+  # (a2) Squash / rebase merge: replay the branch's tree on top of its
+  # merge-base with the base, then ask whether that combined patch is
+  # already in base.
+  mb=$(git merge-base "$base_sha" "$branch" 2>/dev/null) || continue
+  tmp=$(git commit-tree "$(git rev-parse "$branch^{tree}")" -p "$mb" -m _ 2>/dev/null) || continue
+  if [[ "$(git cherry "$base_sha" "$tmp" 2>/dev/null)" == "- "* ]]; then
+    drop "$branch" "squash-merged" && deleted_merged=$((deleted_merged + 1))
+    continue
+  fi
+
+  # (b) GitHub PR state: catches cross-fork squashes (which the local
+  # patch-id check above can miss) and PRs closed without merging.
+  if [ -n "$pr_data" ]; then
+    pr_state=$(printf '%s\n' "$pr_data" | awk -v b="$branch" '$2 == b { print $1; exit }')
+    case "$pr_state" in
+      MERGED)
+        drop "$branch" "PR merged" && deleted_merged=$((deleted_merged + 1))
+        continue ;;
+      CLOSED)
+        drop "$branch" "PR closed" && deleted_abandoned=$((deleted_abandoned + 1))
+        continue ;;
+    esac
+  fi
+
+  tip_email=""
+  [ -n "$my_email" ] && tip_email=$(git log -1 --format=%ae "$branch" 2>/dev/null)
+
+  # (c) Foreign author: a branch you pulled down to review.
+  if [ -n "$tip_email" ] && [ "$tip_email" != "$my_email" ]; then
+    drop "$branch" "foreign author" && deleted_review=$((deleted_review + 1))
+    continue
+  fi
+
+  # (d) Mine + no PR record + tip hasn't moved in $stale_days days.
+  # Guarded on $pr_data being non-empty so a missing/unauth'd gh can't
+  # be misread as "no branches have PRs" and trigger mass deletion.
+  if [ -n "$pr_data" ] && [ "$tip_email" = "$my_email" ]; then
+    if ! printf '%s\n' "$pr_data" | awk -v b="$branch" '$2 == b {f=1} END{exit !f}'; then
+      tip_ts=$(git log -1 --format=%ct "$branch" 2>/dev/null)
+      if [ -n "$tip_ts" ] && [ "$tip_ts" -lt "$stale_cutoff" ]; then
+        drop "$branch" "stale orphan" && deleted_stale=$((deleted_stale + 1))
+      fi
+    fi
+  fi
+done < <(git for-each-ref --format='%(refname:short)' refs/heads/)
+
+prefix="gh-clean:"
+[ "$dry_run" -eq 1 ] && prefix="gh-clean: dry run:"
+echo "$prefix ${deleted_merged} merged + ${deleted_abandoned} abandoned + ${deleted_review} review + ${deleted_stale} stale branch(es)."
