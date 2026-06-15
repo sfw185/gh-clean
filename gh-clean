@@ -86,12 +86,12 @@ protected=$(git worktree list --porcelain | sed -n 's@^branch refs/heads/@@p')
 
 drop() {
   local branch="$1" reason="$2"
-  if [ "$dry_run" -eq 1 ]; then
-    printf '  would delete %-45s [%s]\n' "$branch" "$reason"
-    return 0
+  local verb="deleted"
+  [ "$dry_run" -eq 1 ] && verb="would delete"
+  if [ "$dry_run" -eq 0 ]; then
+    git branch -D "$branch" >/dev/null || return 1
   fi
-  git branch -D "$branch" >/dev/null && \
-    printf '  deleted %-45s [%s]\n' "$branch" "$reason"
+  printf '  %-12s %-45s [%s]\n' "$verb" "$branch" "$reason"
 }
 
 deleted_merged=0
@@ -99,7 +99,9 @@ deleted_abandoned=0
 deleted_review=0
 deleted_stale=0
 
-while IFS= read -r branch; do
+# for-each-ref hands us name + tip-author + tip-commit-time in one shot,
+# saving a `git log` per branch.
+while IFS=$'\t' read -r branch tip_email tip_ts; do
   [ -n "$branch" ] || continue
   case "$branch" in main|master) continue ;; esac
   [ "$branch" = "$base_branch" ] && continue
@@ -121,25 +123,24 @@ while IFS= read -r branch; do
     continue
   fi
 
+  # PR-state lookup, used by both rule (b) and the (d) stale-orphan guard.
+  pr_state=""
+  [ -n "$pr_data" ] && pr_state=$(printf '%s\n' "$pr_data" \
+    | awk -v b="$branch" '$2 == b { print $1; exit }')
+
   # (b) GitHub PR state: catches cross-fork squashes (which the local
   # patch-id check above can miss) and PRs closed without merging.
-  if [ -n "$pr_data" ]; then
-    pr_state=$(printf '%s\n' "$pr_data" | awk -v b="$branch" '$2 == b { print $1; exit }')
-    case "$pr_state" in
-      MERGED)
-        drop "$branch" "PR merged" && deleted_merged=$((deleted_merged + 1))
-        continue ;;
-      CLOSED)
-        drop "$branch" "PR closed" && deleted_abandoned=$((deleted_abandoned + 1))
-        continue ;;
-    esac
-  fi
-
-  tip_email=""
-  [ -n "$my_email" ] && tip_email=$(git log -1 --format=%ae "$branch" 2>/dev/null)
+  case "$pr_state" in
+    MERGED)
+      drop "$branch" "PR merged" && deleted_merged=$((deleted_merged + 1))
+      continue ;;
+    CLOSED)
+      drop "$branch" "PR closed" && deleted_abandoned=$((deleted_abandoned + 1))
+      continue ;;
+  esac
 
   # (c) Foreign author: a branch you pulled down to review.
-  if [ -n "$tip_email" ] && [ "$tip_email" != "$my_email" ]; then
+  if [ -n "$my_email" ] && [ -n "$tip_email" ] && [ "$tip_email" != "$my_email" ]; then
     drop "$branch" "foreign author" && deleted_review=$((deleted_review + 1))
     continue
   fi
@@ -147,15 +148,14 @@ while IFS= read -r branch; do
   # (d) Mine + no PR record + tip hasn't moved in $stale_days days.
   # Guarded on $pr_data being non-empty so a missing/unauth'd gh can't
   # be misread as "no branches have PRs" and trigger mass deletion.
-  if [ -n "$pr_data" ] && [ "$tip_email" = "$my_email" ]; then
-    if ! printf '%s\n' "$pr_data" | awk -v b="$branch" '$2 == b {f=1} END{exit !f}'; then
-      tip_ts=$(git log -1 --format=%ct "$branch" 2>/dev/null)
-      if [ -n "$tip_ts" ] && [ "$tip_ts" -lt "$stale_cutoff" ]; then
-        drop "$branch" "stale orphan" && deleted_stale=$((deleted_stale + 1))
-      fi
-    fi
+  if [ -n "$pr_data" ] && [ -z "$pr_state" ] \
+     && [ -n "$my_email" ] && [ "$tip_email" = "$my_email" ] \
+     && [ -n "$tip_ts" ] && [ "$tip_ts" -lt "$stale_cutoff" ]; then
+    drop "$branch" "stale orphan" && deleted_stale=$((deleted_stale + 1))
   fi
-done < <(git for-each-ref --format='%(refname:short)' refs/heads/)
+done < <(git for-each-ref \
+  --format='%(refname:short)%09%(authoremail:trim)%09%(committerdate:unix)' \
+  refs/heads/)
 
 prefix="gh-clean:"
 [ "$dry_run" -eq 1 ] && prefix="gh-clean: dry run:"
